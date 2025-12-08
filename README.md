@@ -26,8 +26,8 @@
 
 [![paper](https://img.shields.io/badge/paper-A42C25?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2511.23473)
 [![Code](https://img.shields.io/badge/Code-000000?style=for-the-badge&logo=github&logoColor=000&logoColor=white)](https://github.com/ypwang61/ThetaEvolve)
+[![X_Summary](https://img.shields.io/badge/X_Summary-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/ypwang61/status/1995493688848667097)
 <!-- [![📁_W&B_LOGS](https://img.shields.io/badge/📁_W&B_LOGS-fcd022?style=for-the-badge&logo=wandb&logoColor=000)](https://wandb.ai/yipingwanguw/verl_few_shot?nw=nwuseryipingwang22) -->
-<!-- [![X_Summary](https://img.shields.io/badge/X_Summary-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/ypwang61/status/1917596101953348000) -->
 <!-- [![Models/Dataset](https://img.shields.io/badge/Models/Dataset-fcd022?style=for-the-badge&logo=huggingface&logoColor=000)](https://huggingface.co/collections/ypwang61/one-shot-rlvr-6827f72c3359b2ffe75fc1a8) -->
 
 </div>
