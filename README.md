@@ -144,7 +144,9 @@ We point out that our solution is better than AlphaEvolve’s, and that our conf
 
 
 
-The program for finding it (with 1e-6 tolerance as OpenEvolve verification, detailed in paper) is shown in `Results/CirclePacking/programs/8B-w_RL@65.py`. For the formal one (without tolerance as AlphaEvolve), the program is shown in `Results/CirclePacking/programs/8B-w_RL@65-Formal.py`. We also provide results from other tasks for visualization.
+The program for finding it (with 1e-6 tolerance as OpenEvolve verification, detailed in paper) is shown in `Results/CirclePacking/programs/8B-w_RL@65.py`. For the formal one (without tolerance as AlphaEvolve), the program is shown in `Results/CirclePacking/programs/8B-w_RL@65-Formal.py`. The later one has a specific function for determing the size for shrinking radii, but in general, you could get close results by shrinking radii with values like 1e-9.
+
+We also provide results from other tasks for visualization.
 
 If you want to run these programs or the initial program, you could try to assign the parameters from config file.
 
