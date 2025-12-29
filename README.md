@@ -144,7 +144,24 @@ We point out that our solution is better than AlphaEvolve’s, and that our conf
 
 
 
-The program for finding it (with 1e-6 tolerance as OpenEvolve verification, detailed in paper) is shown in `Results/CirclePacking/programs/8B-w_RL@65.py`. We also provide results from other tasks for visualization.
+The program for finding it (with 1e-6 tolerance as OpenEvolve verification, detailed in paper) is shown in `Results/CirclePacking/programs/8B-w_RL@65.py`. For the formal one (without tolerance as AlphaEvolve), the program is shown in `Results/CirclePacking/programs/8B-w_RL@65-Formal.py`. We also provide results from other tasks for visualization.
+
+If you want to run these programs or the initial program, you could try to assign the parameters from config file.
+
+```
+TASK="circle_packing_modular"
+
+CONFIG_POSTFIX="it_XL"
+
+# # test command with verifier
+OPENEVOLVE_CONFIG_PATH=$PWD/examples/${TASK}/configs/config_${TASK}_${CONFIG_POSTFIX}.yaml \
+PYTHONPATH=$PWD \
+python $PWD/examples/${TASK}/evaluators/evaluator_modular.py \
+$PWD/examples/${TASK}/initial_programs/initial_program.py
+```
+
+Or you could just replace the parameters to directly rerun.
+
 
 ## Citation
 If you find our work useful, please consider citing:
