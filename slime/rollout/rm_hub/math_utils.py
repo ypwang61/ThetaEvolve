@@ -5,7 +5,6 @@ Answer checker API that uses sympy to simplify expressions and check for equalit
 Call grade_answer(given_answer: str, ground_truth: str).
 """
 import re
-from typing import Optional
 
 import sympy
 from pylatexenc import latex2text
@@ -13,17 +12,17 @@ from sympy.parsing import sympy_parser
 
 
 # Dan Hendrycks' code
-def mathd_normalize_answer(answer: Optional[str]) -> Optional[str]:
+def mathd_normalize_answer(answer: str | None) -> str | None:
     if answer is None:
         return None
     answer = answer.strip()
     try:
         # Remove enclosing `\text{}`.
-        m = re.search("^\\\\text\{(?P<text>.+?)\}$", answer)
+        m = re.search(r"^\\text\{(?P<text>.+?)\}$", answer)
         if m is not None:
             answer = m.group("text").strip()
         return _strip_string(answer)
-    except:
+    except Exception:
         return answer
 
 
@@ -40,7 +39,7 @@ def _strip_string(string):
                 else:
                     try:
                         assert len(substr) >= 2
-                    except:
+                    except Exception:
                         return string
                     a = substr[0]
                     b = substr[1]
@@ -67,10 +66,10 @@ def _strip_string(string):
         try:
             a = int(a)
             b = int(b)
-            assert string == "{}/{}".format(a, b)
+            assert string == f"{a}/{b}"
             new_string = "\\frac{" + str(a) + "}{" + str(b) + "}"
             return new_string
-        except:
+        except Exception:
             return string
 
     def _remove_right_units(string):
@@ -98,25 +97,20 @@ def _strip_string(string):
 
     # linebreaks
     string = string.replace("\n", "")
-    # print(string)
 
     # remove inverse spaces
     string = string.replace("\\!", "")
-    # print(string)
 
     # replace \\ with \
     string = string.replace("\\\\", "\\")
-    # print(string)
 
     # replace tfrac and dfrac with frac
     string = string.replace("tfrac", "frac")
     string = string.replace("dfrac", "frac")
-    # print(string)
 
     # remove \left and \right
     string = string.replace("\\left", "")
     string = string.replace("\\right", "")
-    # print(string)
 
     # Remove circ (degrees)
     string = string.replace("^{\\circ}", "")
@@ -130,7 +124,7 @@ def _strip_string(string):
 
     # remove percentage
     string = string.replace("\\%", "")
-    string = string.replace("\%", "")
+    string = string.replace(r"\%", "")
 
     # " 0." equivalent to " ." and "{0." equivalent to "{." Alternatively, add "0" if "." is the start of the string
     string = string.replace(" .", " 0.")
@@ -167,7 +161,7 @@ def _strip_string(string):
 
 # sympy might hang -- we don't care about trying to be lenient in these cases
 BAD_SUBSTRINGS = ["^{", "^("]
-BAD_REGEXES = ["\^[0-9]+\^", "\^[0-9][0-9]+"]
+BAD_REGEXES = [r"\^[0-9]+\^", r"\^[0-9][0-9]+"]
 TUPLE_CHARS = "()[]"
 
 
@@ -202,14 +196,14 @@ def _is_float(num: str) -> bool:
     try:
         float(num)
         return True
-    except ValueError:
+    except Exception:
         return False
 
 
 def _is_int(x: float) -> bool:
     try:
         return abs(x - int(round(x))) <= 1e-7
-    except:
+    except Exception:
         return False
 
 
@@ -222,11 +216,11 @@ def _str_is_int(x: str) -> bool:
         x = _strip_properly_formatted_commas(x)
         x = float(x)
         return abs(x - int(round(x))) <= 1e-7
-    except:
+    except Exception:
         return False
 
 
-def _str_to_int(x: str) -> bool:
+def _str_to_int(x: str) -> int:
     x = x.replace(",", "")
     x = float(x)
     return int(x)
@@ -244,7 +238,7 @@ def _inject_implicit_mixed_number(step: str):
 
 def _strip_properly_formatted_commas(expr: str):
     # We want to be careful because we don't want to strip tuple commas
-    p1 = re.compile("(\d)(,)(\d\d\d)($|\D)")
+    p1 = re.compile(r"(\d)(,)(\d\d\d)($|\D)")
     while True:
         next_expr = p1.sub("\\1\\3\\4", expr)
         if next_expr == expr:
@@ -259,7 +253,7 @@ def _normalize(expr: str) -> str:
         return None
 
     # Remove enclosing `\text{}`.
-    m = re.search("^\\\\text\{(?P<text>.+?)\}$", expr)
+    m = re.search(r"^\\text\{(?P<text>.+?)\}$", expr)
     if m is not None:
         expr = m.group("text")
 
@@ -292,8 +286,8 @@ def _normalize(expr: str) -> str:
         "inch",
         "yard",
     ]:
-        expr = re.sub(f"{unit}(es)?(s)? *(\^[0-9]+)?", "", expr)
-    expr = re.sub(f"\^ *\\\\circ", "", expr)
+        expr = re.sub(rf"{unit}(es)?(s)? *(\^[0-9]+)?", "", expr)
+    expr = re.sub(r"\^ *\\circ", "", expr)
 
     if len(expr) > 0 and expr[0] == "{" and expr[-1] == "}":
         expr = expr[1:-1]
@@ -304,7 +298,7 @@ def _normalize(expr: str) -> str:
     if "\\" in expr:
         try:
             expr = _parse_latex(expr)
-        except:
+        except Exception:
             pass
 
     # edge case with mixed numbers and negative signs
@@ -358,7 +352,7 @@ def are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str):
             simplified = sympy.simplify(sympy_diff)
             if simplified == 0:
                 are_equal = True
-    except:
+    except Exception:
         pass
     return are_equal
 
@@ -402,7 +396,7 @@ def last_boxed_only_string(string):
                 break
         i += 1
 
-    if right_brace_idx == None:
+    if right_brace_idx is None:
         retval = None
     else:
         retval = string[idx : right_brace_idx + 1]
@@ -416,7 +410,7 @@ def remove_boxed(s):
         assert s[: len(left)] == left
         assert s[-1] == "}"
         return s[len(left) : -1]
-    except:
+    except Exception:
         return None
 
 
@@ -450,7 +444,7 @@ def grade_answer_sympy(given_answer: str, ground_truth: str) -> bool:
     elif len(ground_truth_elems) != len(given_elems):
         is_correct = False
     else:
-        for ground_truth_elem, given_elem in zip(ground_truth_elems, given_elems):
+        for ground_truth_elem, given_elem in zip(ground_truth_elems, given_elems, strict=False):
             if _is_frac(ground_truth_elem) and _is_frac(given_elem):
                 # if fractions aren't reduced, then shouldn't be marked as correct
                 # so, we don't want to allow sympy.simplify in this case

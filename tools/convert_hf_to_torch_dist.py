@@ -10,7 +10,7 @@ from megatron.training.training import get_model
 
 import slime_plugins.mbridge  # noqa: F401
 from mbridge import AutoBridge
-from slime.backends.megatron_utils import set_default_megatron_args
+from slime.backends.megatron_utils.arguments import set_default_megatron_args
 from slime.backends.megatron_utils.initialize import init
 from slime.backends.megatron_utils.model_provider import get_model_provider_func
 
@@ -28,6 +28,16 @@ def add_convertion_args(parser):
 def get_args():
     args = parse_args(add_convertion_args)
     args = set_default_megatron_args(args)
+    # Conversion script uses Megatron parser directly, so newer SLIME-specific
+    # fields used in model_provider may be absent on Namespace.
+    if not hasattr(args, "megatron_to_hf_mode"):
+        args.megatron_to_hf_mode = "raw"
+    if not hasattr(args, "custom_model_provider_path"):
+        args.custom_model_provider_path = None
+    if not hasattr(args, "only_train_params_name_list"):
+        args.only_train_params_name_list = None
+    if not hasattr(args, "freeze_params_name_list"):
+        args.freeze_params_name_list = None
 
     # set to pass megatron validate_args
     args.save_interval = 1

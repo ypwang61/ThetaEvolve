@@ -58,7 +58,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 8
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
-   --rollout-temperature 0.8
+   --rollout-temperature 1
 
    --global-batch-size 64
    --balance-data
@@ -69,7 +69,7 @@ EVAL_ARGS=(
    --eval-prompt-data aime ${BASE_FOLDER}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 16384
-   --eval-top-p 0.7
+   --eval-top-p 1
 )
 
 PERF_ARGS=(
@@ -126,7 +126,6 @@ SGLANG_ARGS=(
    --sglang-ep-size 32
    --sglang-enable-dp-lm-head
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-   --sglang-disable-radix-cache
 
    --sglang-moe-a2a-backend deepep
    --sglang-deepep-mode auto
@@ -180,7 +179,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
-   ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \

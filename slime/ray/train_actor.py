@@ -1,4 +1,5 @@
 import abc
+import logging
 import os
 import random
 from datetime import timedelta
@@ -7,8 +8,13 @@ import ray
 import torch
 import torch.distributed as dist
 
+import slime.utils.eval_config
 from slime.ray.ray_actor import RayActor
 from slime.utils.distributed_utils import init_gloo_group
+from slime.utils.logging_utils import configure_logger
+from slime.utils.memory_utils import clear_memory, print_memory
+
+logger = logging.getLogger(__name__)
 
 
 def get_local_gpu_id():
@@ -20,7 +26,9 @@ def get_local_gpu_id():
 
 
 class TrainRayActor(RayActor):
-    def __init__(self, world_size, rank, master_addr, master_port, wandb_run_id):
+    def __init__(self, world_size, rank, master_addr, master_port):
+        configure_logger()
+
         self._world_size = world_size
         self._rank = rank
         if master_addr:
@@ -39,16 +47,26 @@ class TrainRayActor(RayActor):
         # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
         os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
 
-    def init(self, args, role, wandb_run_id, with_ref=False):
+    def init(self, args, role, with_ref=False, with_opd_teacher=False):
         self.args = args
         self.role = role
         self.with_ref = with_ref
+        self.with_opd_teacher = with_opd_teacher
+
+        torch.serialization.add_safe_globals([slime.utils.eval_config.EvalDatasetConfig])
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(f"cuda:{local_rank}")
 
+        # Use hybrid backend when FSDP CPU offload is enabled with a CPU backend
+        backend = args.distributed_backend
+        if getattr(args, "fsdp_cpu_offload", False) and getattr(args, "fsdp_cpu_backend", None):
+            cpu_backend = args.fsdp_cpu_backend
+            backend = f"cpu:{cpu_backend},cuda:{args.distributed_backend}"
+            logger.info(f"FSDP CPU offload enabled, using hybrid backend: {backend}")
+
         dist.init_process_group(
-            backend=args.distributed_backend,
+            backend=backend,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),
         )
         init_gloo_group()
@@ -57,22 +75,31 @@ class TrainRayActor(RayActor):
         args.world_size = dist.get_world_size()
 
         try:
-            import pynvml
+            if torch.version.hip is not None:
+                logger.info("Detected ROCm/HIP environment, skipping NUMA affinity setup")
+                # will find the coresponding API to implement ROCm version as below
+            else:
+                import pynvml
 
-            pynvml.nvmlInit()
+                pynvml.nvmlInit()
 
-            local_rank = int(os.environ["RANK"]) % args.num_gpus_per_node
+                local_rank = int(os.environ["RANK"]) % args.num_gpus_per_node
 
-            handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
-            pynvml.nvmlDeviceSetCpuAffinity(handle)
+                handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+                pynvml.nvmlDeviceSetCpuAffinity(handle)
 
-            print(f"Set NUMA affinity for GPU {local_rank}")
-            pynvml.nvmlShutdown()
+                logger.info(f"Set NUMA affinity for GPU {local_rank}")
+                pynvml.nvmlShutdown()
 
         except ImportError:
-            print(f"Warning: pynvml not available, skipping NUMA affinity setup")
+            logger.info("Warning: pynvml not available, skipping NUMA affinity setup")
         except Exception as e:
-            print(f"Warning: Failed to set NUMA affinity: {e}")
+            logger.info(f"Warning: Failed to set NUMA affinity: {e}")
+
+    def clear_memory(self):
+        print_memory("before TrainRayActor.clear_memory")
+        clear_memory()
+        print_memory("after TrainRayActor.clear_memory")
 
     @abc.abstractmethod
     def sleep(self, tags):
@@ -87,7 +114,7 @@ class TrainRayActor(RayActor):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def save_model(self, iteration):
+    def save_model(self, rollout_id, force_sync=False):
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -98,5 +125,11 @@ class TrainRayActor(RayActor):
     def connect_actor_critic(self, critic_group):
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def _get_parallel_config(self):
+        raise NotImplementedError
+
     def set_rollout_manager(self, rollout_manager):
         self.rollout_manager = rollout_manager
+        if self.args.rank == 0:
+            ray.get(self.rollout_manager.set_train_parallel_config.remote(self.train_parallel_config))

@@ -7,8 +7,8 @@
 export SAVE_PATH=/path/to/disk
 
 #### Model selection ####
-SMALL_MODEL_NAME="dpsk_prorl_v2_1.5b"
-# SMALL_MODEL_NAME="dpsk_distill_qwen3_8b"
+# SMALL_MODEL_NAME="dpsk_prorl_v2_1.5b"
+SMALL_MODEL_NAME="dpsk_distill_qwen3_8b"
 
 #### Task configuration ####
 # TASK="hadamard_matrix"

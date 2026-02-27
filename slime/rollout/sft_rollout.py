@@ -1,12 +1,17 @@
-from transformers import AutoTokenizer
+import logging
 
 from slime.utils.mask_utils import MultiTurnLossMaskGenerator
+from slime.utils.processing_utils import load_processor, load_tokenizer
 
 __all__ = ["generate_rollout"]
 
+logger = logging.getLogger(__name__)
+
 
 TOKENIZER = None
+PROCESSOR = None
 MASK_GENERATOR = None
+SAMPLE_PRINTED = False
 
 
 def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
@@ -24,24 +29,36 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
     assert not evaluation
     assert args.rollout_global_dataset
 
-    global TOKENIZER, MASK_GENERATOR
+    global TOKENIZER, PROCESSOR, MASK_GENERATOR, SAMPLE_PRINTED
     if TOKENIZER is None:
-        TOKENIZER = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        TOKENIZER = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+
+    if PROCESSOR is None:
+        PROCESSOR = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
     if MASK_GENERATOR is None:
         MASK_GENERATOR = MultiTurnLossMaskGenerator(TOKENIZER, tokenizer_type=args.loss_mask_type)
 
     samples = data_buffer.get_samples(args.rollout_batch_size)
 
-    for sample in samples:
+    for i, sample in enumerate(samples):
         (sample,) = sample
         messages = sample.prompt
-        token_ids, loss_mask = MASK_GENERATOR.get_loss_mask(messages)
+        tools = sample.metadata.get("tools", None)
+
+        token_ids, loss_mask = MASK_GENERATOR.get_loss_mask(messages, tools=tools)
+
         response_length = MASK_GENERATOR.get_response_lengths([loss_mask])[0]
 
         sample.tokens = token_ids
         sample.response_length = response_length
         sample.reward = 0
         sample.loss_mask = loss_mask[-response_length:]
+
+        if i == 0 and not SAMPLE_PRINTED:
+            logger.info(
+                f"sft_rollout::generate_rollout example data: {sample=} (raw){messages=} (raw){token_ids=} (raw){loss_mask=} {response_length=}"
+            )
+            SAMPLE_PRINTED = True
 
     return samples

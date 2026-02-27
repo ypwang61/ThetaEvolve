@@ -47,6 +47,10 @@ fi
 # Create checkpoint directory
 mkdir -p "${CKPT_DIR}"
 
+# Always use a fresh local Ray session.
+unset RAY_ADDRESS
+rm -f /tmp/ray/ray_current_cluster
+
 pkill -9 sglang
 sleep 3
 ray stop --force
@@ -57,6 +61,10 @@ pkill -9 ray
 # pkill -9 python
 
 set -ex
+
+# Raise open-file limit to prevent Ray grpc/raylet FD exhaustion.
+ulimit -n 1048576 || ulimit -n 65535
+echo "[limits] nofile soft limit: $(ulimit -n)"
 
 export PYTHONBUFFERED=16
 export TOKENIZERS_PARALLELISM=false
@@ -73,6 +81,22 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source scripts/models/deepseek-r1-distill-qwen-1.5B.sh
 
+# Auto-size Ray/SLIME GPU allocation to avoid hanging on oversized placement groups.
+TOTAL_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [ "${TOTAL_GPUS}" -ge 4 ]; then
+  RAY_NUM_GPUS=4
+  ACTOR_NUM_GPUS=2
+  ROLLOUT_NUM_GPUS=2
+elif [ "${TOTAL_GPUS}" -ge 2 ]; then
+  RAY_NUM_GPUS=2
+  ACTOR_NUM_GPUS=1
+  ROLLOUT_NUM_GPUS=1
+else
+  echo "Need at least 2 GPUs, but detected ${TOTAL_GPUS}."
+  exit 1
+fi
+echo "[gpu] detected=${TOTAL_GPUS}, ray=${RAY_NUM_GPUS}, actor=${ACTOR_NUM_GPUS}, rollout=${ROLLOUT_NUM_GPUS}"
+
 CKPT_ARGS=(
    --hf-checkpoint "${SAVE_SHM_DIR}/${MODEL_NAME}"
    --ref-load "${SAVE_SHM_DIR}/${MODEL_NAME}_torch_dist"
@@ -83,6 +107,7 @@ CKPT_ARGS=(
 
 ROLLOUT_ARGS=(
   --disable-rollout-global-dataset
+  --data-source-path slime.rollout.data_source.RolloutDataSourceWithBuffer
   --evolving-gym
   --evolving-gym-initial-program "${INITIAL_PROGRAM}"
   --evolving-gym-evaluator-file "${EVALUATOR_FILE}"
@@ -176,8 +201,10 @@ MISC_ARGS=(
 
 # Start Ray (training/inference separation: don't use --colocate; use train_async.py)
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
-
+# Keep Ray temp path very short; AF_UNIX sockets must stay <= 107 chars.
+RAY_TMP_DIR="$(mktemp -d /tmp/ray.XXXXXX)"
+echo "[ray] temp dir: ${RAY_TMP_DIR}"
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${RAY_NUM_GPUS} --temp-dir "${RAY_TMP_DIR}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Disable Triton
 export TRITON_DISABLE=1
@@ -193,39 +220,17 @@ export PYARROW_TMP_DIR=$FAST_MOUNT/tmp
 mkdir -p "$HF_DATASETS_CACHE" "$DATASETS_TMPDIR"
 echo "[disk] HF_DATASETS_CACHE=$HF_DATASETS_CACHE TMPDIR=$TMPDIR"
 
+export PYTHONPATH="/root/Megatron-LM/"
+export CUDA_DEVICE_MAX_CONNECTIONS="1"
+export NCCL_NVLS_ENABLE="${HAS_NVLINK}"
+export DATASETS_CACHE="${HF_DATASETS_CACHE}"
+export WANDB_GROUP="${RUN_NAME}"
+export SLIME_PG_CPU_PER_BUNDLE="${SLIME_PG_CPU_PER_BUNDLE:-0.5}"
 
-# Build the runtime environment JSON with proper variable substitution
-RUNTIME_ENV_JSON="$(cat <<JSON
-{
-  "env_vars": {
-    "PYTHONPATH": "/root/Megatron-LM/",
-    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-    "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
-    "HF_HOME": "${HF_HOME}",
-    "HUGGINGFACE_HUB_CACHE": "${HUGGINGFACE_HUB_CACHE}",
-    "TRANSFORMERS_CACHE": "${TRANSFORMERS_CACHE}",
-    "HF_DATASETS_CACHE": "${HF_DATASETS_CACHE}",
-    "DATASETS_CACHE": "${DATASETS_CACHE}",
-    "DATASETS_TMPDIR": "${DATASETS_TMPDIR}",
-    "PYARROW_TMP_DIR": "${PYARROW_TMP_DIR}",
-    "TMPDIR": "${TMPDIR}",
-    "WANDB_CACHE_DIR": "${WANDB_CACHE_DIR}",
-    "WANDB_DIR": "${WANDB_DIR}",
-    "WANDB_GROUP": "${RUN_NAME}",
-    "TRITON_DISABLE": "1"
-  }
-}
-JSON
-)"
-
-echo "RUNTIME_ENV_JSON = $RUNTIME_ENV_JSON"
-
-ray job submit --address="http://127.0.0.1:8265" \
-  --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- python3 train.py \
+python3 train.py \
   --actor-num-nodes 1 \
-  --actor-num-gpus-per-node 2 \
-  --rollout-num-gpus 2 \
+  --actor-num-gpus-per-node ${ACTOR_NUM_GPUS} \
+  --rollout-num-gpus ${ROLLOUT_NUM_GPUS} \
   ${MODEL_ARGS[@]} \
   ${CKPT_ARGS[@]} \
   ${ROLLOUT_ARGS[@]} \
@@ -235,5 +240,5 @@ ray job submit --address="http://127.0.0.1:8265" \
   ${WANDB_ARGS[@]} \
   ${PERF_ARGS[@]} \
   ${SGLANG_ARGS[@]} \
-  ${MISC_ARGS[@]} 
+  ${MISC_ARGS[@]}
   

@@ -8,7 +8,7 @@ Optimized for string prefixes with corresponding token IDs.
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 @dataclass
@@ -16,11 +16,11 @@ class MatchResult:
     """Result of prefix matching operation."""
 
     matched_prefix: str
-    token_ids: List[int]
-    logp: List[float]
-    loss_mask: List[int]  # Added loss mask for model generation parts
+    token_ids: list[int]
+    logp: list[float]
+    loss_mask: list[int]  # Added loss mask for model generation parts
     remaining_string: str
-    last_node: "StringTreeNode"
+    last_node: StringTreeNode
 
 
 class StringTreeNode:
@@ -28,16 +28,16 @@ class StringTreeNode:
 
     counter = 0
 
-    def __init__(self, node_id: Optional[int] = None):
+    def __init__(self, node_id: int | None = None):
         # Core tree structure
-        self.children: List[StringTreeNode] = []  # Use list to store children
-        self.parent: Optional[StringTreeNode] = None
+        self.children: list[StringTreeNode] = []  # Use list to store children
+        self.parent: StringTreeNode | None = None
 
         # Node data
         self.string_key: str = ""  # The string fragment this node represents
-        self.token_ids: Optional[List[int]] = None  # Token IDs for this node only (not cumulative)
-        self.logp: Optional[List[float]] = None  # Log probabilities for this node's tokens
-        self.loss_mask: Optional[List[int]] = None  # Loss mask for model generation parts
+        self.token_ids: list[int] | None = None  # Token IDs for this node only (not cumulative)
+        self.logp: list[float] | None = None  # Log probabilities for this node's tokens
+        self.loss_mask: list[int] | None = None  # Loss mask for model generation parts
 
         # Access tracking
         self.last_access_time = time.monotonic()
@@ -47,7 +47,7 @@ class StringTreeNode:
         self.ref_count = 0
 
         # Weight version tracking
-        self.weight_version: Optional[int] = None  # Weight version for this node
+        self.weight_version: int | None = None  # Weight version for this node
 
         # Node identification
         self.id = StringTreeNode.counter if node_id is None else node_id
@@ -201,10 +201,10 @@ class StringRadixTrie:
     def insert(
         self,
         text: str,
-        token_ids: List[int],
-        logp: Optional[List[float]] = None,
-        loss_mask: Optional[List[int]] = None,
-        weight_version: Optional[int] = None,
+        token_ids: list[int],
+        logp: list[float] | None = None,
+        loss_mask: list[int] | None = None,
+        weight_version: int | None = None,
     ) -> bool:
         """
         Insert a string and its corresponding token IDs, log probabilities, and loss mask into the trie.
@@ -276,10 +276,10 @@ class StringRadixTrie:
     def _insert(
         self,
         text: str,
-        token_ids: List[int],
-        logp: List[float],
-        loss_mask: List[int],
-        weight_version: Optional[int] = None,
+        token_ids: list[int],
+        logp: list[float],
+        loss_mask: list[int],
+        weight_version: int | None = None,
     ) -> bool:
         """Insert tokens - skip tokens for existing nodes just like we skip text."""
 
@@ -291,6 +291,7 @@ class StringRadixTrie:
 
         # Track all nodes traversed during insert for weight version update
         traversed_nodes = [current_node]
+        new_node = None
 
         while remaining_text:
             # Find best startswith match
@@ -344,9 +345,8 @@ class StringRadixTrie:
                 self.cur_cache_size += len(remaining_tokens)
 
         # Update weight version for all traversed nodes
-        if weight_version is not None:
-            for node in traversed_nodes:
-                node.weight_version = weight_version
+        if weight_version is not None and new_node:
+            new_node.weight_version = weight_version
 
         return True
 
@@ -371,7 +371,7 @@ class StringRadixTrie:
                 return removed_count > 0
             return False
 
-    def _find_node_by_text(self, text: str) -> Optional[StringTreeNode]:
+    def _find_node_by_text(self, text: str) -> StringTreeNode | None:
         """
         Find node by exact text match.
         Args:
@@ -436,7 +436,7 @@ class StringRadixTrie:
             return True
         return False
 
-    def gc_by_weight_version(self, current_weight_version: Optional[int] = None) -> int:
+    def gc_by_weight_version(self, current_weight_version: int | None = None) -> int:
         """
         Perform garbage collection based on weight version.
         Remove nodes with weight_version < (current_weight_version - gc_threshold_k).
@@ -470,7 +470,7 @@ class StringRadixTrie:
 
             return removed_count
 
-    def _find_outdated_nodes(self, gc_threshold: int) -> List[StringTreeNode]:
+    def _find_outdated_nodes(self, gc_threshold: int) -> list[StringTreeNode]:
         """
         Find nodes that should be removed based on weight version threshold.
         Uses layer-by-layer traversal - if parent is outdated, children are not checked.
@@ -521,7 +521,7 @@ class StringRadixTrie:
         # Start validation from the node itself
         validate_recursive(node, node.weight_version)
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
         with self._lock:
             total_requests = self.cache_hits + self.cache_misses
@@ -576,7 +576,7 @@ class StringRadixTrie:
         for child in node.children:
             self._print_node(child, depth + 1)
 
-    def retrieve_from_text(self, text: str, return_logprob: bool = False):
+    def retrieve_from_text(self, text: str, return_logprob: bool = True):
         """
         Get tokens from text by looking up in radix tree or using tokenizer.
         Also fetches weight version from worker during this operation.
@@ -592,11 +592,16 @@ class StringRadixTrie:
 
         # If we have a match and it covers the entire text, return the tokens
         if result.matched_prefix and result.token_ids:
-            if return_logprob:
-                return (result.token_ids, result.logp, result.loss_mask)
-            else:
-                return result.token_ids
-
+            additional_tokens = self.tokenizer(result.remaining_string, add_special_tokens=False)["input_ids"]
+            return (
+                result.token_ids + additional_tokens,
+                (
+                    result.logp + len(additional_tokens) * [0.0]
+                    if return_logprob
+                    else [0] * len(result.token_ids + additional_tokens)
+                ),
+                result.loss_mask + len(additional_tokens) * [0],
+            )
         # If result is empty and input text is not empty, tokenize with tokenizer
         # This is needed because we cannot get the prompt token id from engine response
         # We have to manually insert the text and token into the tree
@@ -606,37 +611,15 @@ class StringRadixTrie:
             # Insert the text and tokens into the tree
             self.insert(text, tokens)
             # Return the tokens
-            if return_logprob:
-                # Return default logp values (0.0) when using tokenizer
-                return (tokens, [0.0] * len(tokens), [1] * len(tokens))
-            else:
-                return tokens
-
-        # If no tokenizer or other cases, return the matched tokens (could be empty)
-        result_tokens = result.token_ids if result else []
-        result_logp = result.logp if result else []
-        result_loss_mask = result.loss_mask if result else []
-
-        # Print tree structure if verbose is enabled
-        if self.verbose:
-            print("Tree structure after retrieve_from_text:")
-            self.pretty_print()
-
-        if return_logprob:
-            return (result_tokens, result_logp, result_loss_mask)
+            return (tokens, [0.0] * len(tokens), [0] * len(tokens))
         else:
-            return result_tokens
+            raise ValueError("Tokenizer or input text can't be empty")
 
 
 # Example usage and testing
 if __name__ == "__main__":
     # Create trie instance for testing
     trie = StringRadixTrie(max_cache_size=100, verbose=True)
-
-    # Test token retrieval
-    print("\nTesting token retrieval:")
-    test_tokens = trie.retrieve_from_text("Hello world")
-    print(f"Tokens for 'Hello world': {test_tokens}")
 
     # Example usage with simplified insert
     test_cases = [

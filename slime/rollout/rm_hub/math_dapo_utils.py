@@ -15,10 +15,9 @@
 
 import re
 import signal
-from typing import Optional
 
 
-def last_boxed_only_string(string: str) -> Optional[str]:
+def last_boxed_only_string(string: str) -> str | None:
     """Extract the last LaTeX boxed expression from a string.
 
     Args:
@@ -136,6 +135,8 @@ REMOVED_EXPRESSIONS = [
     "{,}",
     '"',
     "\\dots",
+    "<|im_end|>",
+    "<|endoftext|>",
 ]
 
 
@@ -148,6 +149,7 @@ def normalize_final_answer(final_answer: str) -> str:
     Returns:
         Normalized answer string
     """
+    final_answer = str(final_answer)
     final_answer = final_answer.split("=")[-1]
 
     # Apply substitutions and removals
@@ -205,12 +207,12 @@ def is_correct_minerva(
     else:
         gt = normalize_final_answer(gt)
 
+    gt = str(int(float(gt)))  # in dapo, all answers are integers
+
     return (pred == gt), pred
 
 
-def is_correct_strict_box(
-    pred: str, gt: str, pause_tokens_index: Optional[list[int]] = None
-) -> tuple[int, Optional[str]]:
+def is_correct_strict_box(pred: str, gt: str, pause_tokens_index: list[int] | None = None) -> tuple[int, str | None]:
     """Check if the prediction is correct using strict boxed answer criteria.
 
     Args:
@@ -236,7 +238,7 @@ def is_correct_strict_box(
 
 
 def verify(
-    solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: Optional[list[int]] = None
+    solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: list[int] | None = None
 ) -> bool:
     """Verify if the solution is correct.
 
@@ -261,7 +263,7 @@ def compute_score(
     solution_str: str,
     ground_truth: str,
     strict_box_verify: bool = False,
-    pause_tokens_index: Optional[list[int]] = None,
+    pause_tokens_index: list[int] | None = None,
 ) -> float:
     """Compute the reward score for a solution.
 

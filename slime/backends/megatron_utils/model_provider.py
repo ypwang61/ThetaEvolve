@@ -1,7 +1,9 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
+import argparse
 import inspect
+import re
 from contextlib import nullcontext
-from typing import Optional
+from typing import Literal
 
 import torch
 from megatron.core import tensor_parallel
@@ -12,23 +14,28 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
+
+from slime.utils.misc import load_function
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
         self,
-        input_size,
-        output_size,
+        input_size: int,
+        output_size: int,
         *,
-        config,
-        bias=True,
-    ):
+        config: TransformerConfig,
+        bias: bool = True,
+    ) -> None:
         super().__init__(in_features=input_size, out_features=output_size, bias=bias)
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel:
             self.weight.sequence_parallel = True
+            if bias:
+                self.bias.sequence_parallel = True
 
         self.weight.data.normal_(mean=0.0, std=0.02)
         if bias:
@@ -36,10 +43,10 @@ class LinearForLastLayer(torch.nn.Linear):
 
     def forward(
         self,
-        input_,
-        weight=None,
-        runtime_gather_output=None,
-    ):
+        input_: torch.Tensor,
+        weight: torch.Tensor | None = None,
+        runtime_gather_output: bool | None = None,
+    ) -> tuple[torch.Tensor, None]:
         logits = super().forward(input_)
         logits = logits.float()
         if self.sequence_parallel:
@@ -47,8 +54,51 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
-def get_model_provider_func(args, role: str = "actor"):
-    def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None) -> GPTModel:
+def get_model_provider_func(
+    args: argparse.Namespace,
+    role: Literal["actor", "critic"] = "actor",
+):
+    # Support custom model provider path (similar to --custom-rm-path for reward models)
+    if getattr(args, "custom_model_provider_path", None):
+
+        def wrapped_model_provider(
+            pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None
+        ) -> GPTModel:
+            custom_model_provider = load_function(args.custom_model_provider_path)
+            # Check if the custom provider supports vp_stage parameter
+            has_vp_stage = "vp_stage" in inspect.signature(custom_model_provider).parameters
+            if has_vp_stage:
+                model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            else:
+                model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            # Apply critic output layer if needed
+            if post_process and role == "critic":
+                model.output_layer = LinearForLastLayer(
+                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                )
+            return model
+
+        return wrapped_model_provider
+
+    if args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
+        # TODO: we should not manually set this...
+        provider.tensor_model_parallel_size = args.tensor_model_parallel_size
+        provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
+        provider.expert_model_parallel_size = args.expert_model_parallel_size
+        provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
+        provider.sequence_parallel = args.sequence_parallel
+        if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
+            provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
+        if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
+            provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+        provider.finalize()
+        return provider.provide
+
+    def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
         """Builds the model.
 
         If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -63,31 +113,8 @@ def get_model_provider_func(args, role: str = "actor"):
         """
         use_te = args.transformer_impl == "transformer_engine"
 
-        if args.record_memory_history:
-            torch.cuda.memory._record_memory_history(
-                # True,
-                # keep 100,000 alloc/free events from before the snapshot
-                max_entries=100000,
-                # record stack information for the trace events
-                # trace_alloc_record_context=True,
-                stacks="all",
-            )
-
-            def oom_observer(device, alloc, device_alloc, device_free):
-                # snapshot right after an OOM happened
-                print("saving allocated state during OOM")
-                snapshot = torch.cuda.memory._snapshot()
-                from pickle import dump
-
-                dump(
-                    snapshot,
-                    open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", "wb"),
-                )
-
-            torch._C._cuda_attach_out_of_memory_observer(oom_observer)
-
         # Experimental loading arguments from yaml
-        config = core_transformer_config_from_args(args)
+        config: TransformerConfig = core_transformer_config_from_args(args)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -107,19 +134,19 @@ def get_model_provider_func(args, role: str = "actor"):
                 # Define the decoder layer spec
                 if use_te:
                     transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
+                        num_experts=args.num_experts,
+                        moe_grouped_gemm=args.moe_grouped_gemm,
+                        qk_layernorm=args.qk_layernorm,
+                        multi_latent_attention=args.multi_latent_attention,
+                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
+                        num_experts=args.num_experts,
+                        moe_grouped_gemm=args.moe_grouped_gemm,
+                        qk_layernorm=args.qk_layernorm,
+                        multi_latent_attention=args.multi_latent_attention,
+                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
                     )
 
         build_model_context = nullcontext
@@ -134,10 +161,10 @@ def get_model_provider_func(args, role: str = "actor"):
                 # Check if fp8_model_init supports preserve_high_precision_init_val
                 if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
                     build_model_context_args["preserve_high_precision_init_val"] = True
-            except:
+            except Exception as e:
                 raise RuntimeError(
                     "--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found."
-                )
+                ) from e
 
         kwargs = {
             "config": config,
@@ -158,7 +185,7 @@ def get_model_provider_func(args, role: str = "actor"):
         if vp_stage is not None:
             kwargs["vp_stage"] = vp_stage
 
-        if getattr(args, "mtp_num_layers", None):
+        if args.mtp_num_layers:
             from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
             mtp_kwargs = {
@@ -179,3 +206,35 @@ def get_model_provider_func(args, role: str = "actor"):
         return model
 
     return model_provider
+
+
+def wrap_model_provider_with_freeze(original_provider, args):
+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None):
+        sig = inspect.signature(original_provider)
+        if "vp_stage" in sig.parameters:
+            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        else:
+            model = original_provider(pre_process=pre_process, post_process=post_process)
+
+        freeze_model_params(model, args)
+
+        return model
+
+    return wrapped_provider
+
+
+def freeze_model_params(model: GPTModel, args: argparse.Namespace):
+    if args.only_train_params_name_list:
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+            for pattern in args.only_train_params_name_list:
+                if re.search(pattern, name):
+                    param.requires_grad = True
+                    break
+
+    if args.freeze_params_name_list:
+        for name, param in model.named_parameters():
+            for pattern in args.freeze_params_name_list:
+                if re.search(pattern, name):
+                    param.requires_grad = False
+                    break

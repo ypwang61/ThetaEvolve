@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: slime
-Version: 0.1.0
+Version: 0.2.2
 Author: slime Team
 Classifier: Programming Language :: Python :: 3.10
 Classifier: Programming Language :: Python :: 3.11
@@ -11,15 +11,20 @@ Classifier: Topic :: System :: Distributed Computing
 Requires-Python: >=3.10
 License-File: LICENSE
 Requires-Dist: accelerate
+Requires-Dist: blobfile
 Requires-Dist: datasets
 Requires-Dist: httpx[http2]
 Requires-Dist: mcp[cli]
+Requires-Dist: memray
+Requires-Dist: omegaconf
 Requires-Dist: pillow
 Requires-Dist: pylatexenc
 Requires-Dist: pyyaml
+Requires-Dist: qwen_vl_utils
 Requires-Dist: ray[default]
+Requires-Dist: ring_flash_attn
+Requires-Dist: sglang-router>=0.2.3
 Requires-Dist: tensorboard
-Requires-Dist: torch
 Requires-Dist: transformers
 Requires-Dist: wandb
 Provides-Extra: fsdp

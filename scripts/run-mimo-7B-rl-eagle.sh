@@ -47,7 +47,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
-   --rollout-temperature 0.8
+   --rollout-temperature 1
 
    --global-batch-size 256
    --balance-data
@@ -58,7 +58,7 @@ EVAL_ARGS=(
    --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 8192
-   --eval-top-p 0.7
+   --eval-top-p 1
 )
 
 PERF_ARGS=(
@@ -113,6 +113,9 @@ SGLANG_ARGS=(
    --sglang-speculative-num-steps 3
    --sglang-speculative-eagle-topk 1
    --sglang-speculative-num-draft-tokens 4
+
+   # sometimes flashinfer has IMA bugs. Use fa3 as instead
+   --sglang-attention-backend fa3
 )
 
 MISC_ARGS=(
@@ -124,6 +127,11 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    # need to comment this when using model with MLA
    --attention-backend flash
+)
+
+SPEC_ARGS=(
+   --enable-mtp-training
+   --mtp-loss-scaling-factor 0.2
 )
 
 # launch the master node of ray in container
@@ -150,9 +158,9 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
-   ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]}
+   ${MISC_ARGS[@]} \
+   ${SPEC_ARGS[@]}

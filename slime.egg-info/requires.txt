@@ -1,13 +1,18 @@
 accelerate
+blobfile
 datasets
 httpx[http2]
 mcp[cli]
+memray
+omegaconf
 pillow
 pylatexenc
 pyyaml
+qwen_vl_utils
 ray[default]
+ring_flash_attn
+sglang-router>=0.2.3
 tensorboard
-torch
 transformers
 wandb
 

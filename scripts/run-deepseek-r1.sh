@@ -46,7 +46,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 128
    --n-samples-per-prompt 8
    --rollout-max-response-len 32768
-   --rollout-temperature 0.8
+   --rollout-temperature 1
 
    --over-sampling-batch-size 256
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
@@ -60,7 +60,7 @@ EVAL_ARGS=(
    --eval-prompt-data aime $BASE_DIR/rl_data/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 32768
-   --eval-top-p 0.7
+   --eval-top-p 1
 )
 
 PERF_ARGS=(
@@ -113,17 +113,16 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 64
    --sglang-mem-fraction-static 0.7
-   --sglang-enable-ep-moe
+   --sglang-ep-size 64
 
    # dp attention
    --sglang-enable-dp-attention
    --sglang-dp-size 8
    --sglang-moe-dense-tp-size 1
    --sglang-enable-dp-lm-head
-   --sglang-disable-radix-cache
 
    # enable deepep for sglang
-   --sglang-enable-deepep-moe
+   --sglang-moe-a2a-backend deepep
    --sglang-deepep-mode auto
 
    # make every dp rank has 128 concurrency
@@ -137,8 +136,7 @@ MISC_ARGS=(
    # should be good for model performance
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   # need to comment this when using model with MLA
-   # --attention-backend flash
+   --attention-backend flash
 
    # use deepep for megatron
    --moe-enable-deepep
@@ -169,7 +167,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
-   ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \

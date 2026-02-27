@@ -1,73 +1,170 @@
-import math
-from typing import Optional
+import logging
+from argparse import Namespace
+from collections.abc import Sequence
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import wandb
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
+from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
+from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
-from slime.utils.timer import Timer
+from slime.utils.types import RolloutBatch
 
+from ...utils import logging_utils
 from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 
+logger = logging.getLogger(__name__)
 
-def get_batch(data_iterator, keys):
-    """Generate a batch."""
+
+def get_batch(
+    data_iterator: "DataIterator",
+    keys: Sequence[str],
+    pad_multiplier: int = 128,
+    qkv_format: str = "thd",
+) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
+    """
+    Generate a CP-ready micro-batch with packed sequence parameters.
+
+    Steps:
+    - Fetch raw fields via iterator.
+    - Save original token tensors under "unconcat_tokens".
+    - Slice tokens into two chunks for Context Parallelism (CP), concatenate, and pad to a configurable multiple.
+    - Build cu_seqlens and `PackedSeqParams` with T-H-D layout (T: sequence length, H: attention heads, D: head dimension).
+
+    Args:
+        data_iterator: Iterator providing micro-batch data.
+        keys: List of keys to fetch from the iterator.
+        pad_multiplier: Multiplier for padding size calculation (default: 128).
+
+    Returns a dict including:
+    - "tokens": torch.LongTensor of shape [1, T_padded] on the current CUDA device
+    - "unconcat_tokens": list[torch.LongTensor] for the micro-batch before CP slicing/concat
+    - "packed_seq_params": PackedSeqParams with T-H-D settings (cu_seqlens on CUDA, dtype=int)
+    Plus any other requested keys forwarded from the iterator.
+    """
 
     assert "tokens" in keys
     batch = data_iterator.get_next(keys)
 
-    packed_seq_params = None
+    if "dynamic_global_batch_size" in data_iterator.rollout_data:
+        batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
+
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
+    pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
 
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
 
     cp_size = mpu.get_context_parallel_world_size()
-    tokens = [slice_with_cp(t, pad_token_id) for t in tokens]
 
-    cu_seqlens = [0]
-    for t in tokens:
-        cu_seqlens.append(cu_seqlens[-1] + t.size(0))
+    if qkv_format == "bshd":
+        max_seqlen = batch["max_seq_lens"][0]
+        assert max([t.size(0) for t in tokens]) <= max_seqlen
+        tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
+        tokens = torch.stack(tokens)
+    elif qkv_format == "thd":
+        tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
 
-    tokens = torch.cat(tokens)
+        cu_seqlens = [0]
+        for t in tokens:
+            cu_seqlens.append(cu_seqlens[-1] + t.size(0))
 
-    # Always pad to 128 to reduce memory fragmentation and maybe make the computation faster
-    # TODO: make this configurable?
-    pad = (128 - tokens.size(0) % 128) % 128
-    if pad != 0:
-        tokens = F.pad(tokens, (0, pad), value=pad_token_id)
-        cu_seqlens.append(cu_seqlens[-1] + pad)
+        tokens = torch.cat(tokens)
 
-    # thd requires the cu_seqlens to be of the origin length
-    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
-    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        # Always pad to reduce memory fragmentation and maybe make the computation faster
+        pad = (pad_size - tokens.size(0) % pad_size) % pad_size
+        if pad != 0:
+            tokens = F.pad(tokens, (0, pad), value=pad_token_id)
+            cu_seqlens.append(cu_seqlens[-1] + pad)
 
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format="thd",
-    )
+        # thd requires the cu_seqlens to be of the origin length
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
-    tokens = tokens.unsqueeze(0)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format="thd",
+        )
+
+        tokens = tokens.unsqueeze(0)
+    else:
+        raise ValueError(f"Unsupported qkv_format: {qkv_format}")
+
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
+
+    # loss masks
+    loss_masks = []
+    for loss_mask, total_length, response_length in zip(
+        batch["loss_masks"],
+        batch["total_lengths"],
+        batch["response_lengths"],
+        strict=True,
+    ):
+        prompt_length = total_length - response_length
+        # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
+        loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
+        loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
+        loss_masks.append(loss_mask)
+
+    if qkv_format == "bshd":
+        loss_masks = torch.stack(loss_masks)
+    elif qkv_format == "thd":
+        loss_masks = torch.cat(loss_masks)
+        loss_masks = F.pad(loss_masks, (0, pad), value=0).unsqueeze(0)
+
+    assert loss_masks.shape == tokens.shape, f"loss_masks.shape: {loss_masks.shape}, tokens.shape: {tokens.shape}"
+    batch["full_loss_masks"] = loss_masks
+
+    # Process multimodal training tensors if present
+    multimodal_train_inputs = batch.get("multimodal_train_inputs", None)
+    if multimodal_train_inputs is not None:
+        multimodal_data = {}  # key -> concatenated tensor
+        multimodal_num_items = {}  # key -> list of item counts per sequence
+        for mm_input_dict in multimodal_train_inputs:
+            if mm_input_dict is not None:
+                for key, mm_tensor in mm_input_dict.items():
+                    if key not in multimodal_data:
+                        multimodal_data[key] = mm_tensor
+                        multimodal_num_items[key] = [mm_tensor.size(0)]
+                    else:
+                        multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)
+                        multimodal_num_items[key].append(mm_tensor.size(0))
+        batch["multimodal_train_inputs"] = multimodal_data
+        batch["multimodal_num_items"] = multimodal_num_items
+
     return batch
 
 
-def gather_log_data(metic_name, args, rollout_id, log_dict):
+def gather_log_data(
+    metric_name: str,
+    args: Namespace,
+    rollout_id: int,
+    log_dict: dict[str, float],
+) -> dict[str, float] | None:
+    """
+    Gather per-rank metrics, reduce by mean on the DP source rank, and log.
+
+    Expects `log_dict` to contain plain scalars. The DP source rank prints and
+    optionally logs to WandB/TensorBoard with a step derived from `rollout_id` and
+    batch sizes. Returns the reduced dict on the DP source rank; returns None on others.
+    """
+
     if mpu.get_data_parallel_rank(with_context_parallel=True) == 0:
-        gathered_log_dict = [None] * mpu.get_data_parallel_world_size(with_context_parallel=True)
+        dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+
+        gathered_log_dict = [None] * dp_size
         # Not sure if this will be a performance bottleneck.
         dist.gather_object(
             log_dict,
@@ -75,31 +172,16 @@ def gather_log_data(metic_name, args, rollout_id, log_dict):
             dst=mpu.get_data_parallel_src_rank(with_context_parallel=True),
             group=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
         )
-        dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+
         reduced_log_dict = {
-            f"{metic_name}/{key}": sum([d[key] for d in gathered_log_dict]) / dp_size for key in log_dict
+            f"{metric_name}/{key}": sum([d[key] for d in gathered_log_dict]) / dp_size for key in log_dict
         }
-        print(f"{metic_name} {rollout_id}: {reduced_log_dict}")
-        if args.use_wandb:
-            reduced_log_dict["rollout/step"] = (
-                rollout_id
-                if not args.wandb_always_use_train_step
-                else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
-            )
-            wandb.log(reduced_log_dict)
+        logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
 
-        if args.use_tensorboard:
-            from slime.utils.tensorboard_utils import _TensorboardAdapter
-
-            tb = _TensorboardAdapter(args)
-            tb.log(
-                data=reduced_log_dict,
-                step=(
-                    rollout_id
-                    if not args.wandb_always_use_train_step
-                    else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
-                ),
-            )
+        # Calculate step once to avoid duplication
+        step = compute_rollout_step(args, rollout_id)
+        reduced_log_dict["rollout/step"] = step
+        logging_utils.log(args, reduced_log_dict, step_key="rollout/step")
 
         return reduced_log_dict
     else:
@@ -113,19 +195,42 @@ def gather_log_data(metic_name, args, rollout_id, log_dict):
 
 
 class DataIterator:
+    """Micro-batch iterator over rollout dicts.
+
+    Supports either fixed contiguous micro-batches or an explicit per-step
+    index schedule (for dynamic batch sizing / sequence-length balancing).
+    """
+
     def __init__(
         self,
-        rollout_data,
-        micro_batch_size: Optional[int] = None,
-        micro_batch_indices: Optional[list[list[int]]] = None,
-    ):
+        rollout_data: RolloutBatch,
+        micro_batch_size: int | None = None,
+        micro_batch_indices: list[list[int]] | None = None,
+    ) -> None:
+        """Initialize an iterator over `rollout_data`.
+
+        Args:
+            rollout_data: Dict of per-sample fields for the local step.
+            micro_batch_size: Fixed contiguous slice size when not using dynamic scheduling.
+            micro_batch_indices: Explicit indices per micro-batch when using dynamic balancing.
+                Must be mutually exclusive with `micro_batch_size`.
+        """
         self.rollout_data = rollout_data
         self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
 
-    def get_next(self, keys):
+    def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
+        """Return the next micro-batch for the requested keys.
+
+        - If `micro_batch_indices` is provided, selects rows according to the current
+          index list for each requested key.
+        - Otherwise, slices a contiguous window of size `micro_batch_size` starting
+          at the current offset.
+
+        Returns a dict mapping each key to a list subset (or None if absent).
+        """
         batch = {}
         for key in keys:
             vals = self.rollout_data.get(key, None)
@@ -147,24 +252,30 @@ class DataIterator:
             self.offset += self.micro_batch_size
         return batch
 
-    def reset(self):
+    def reset(self) -> "DataIterator":
+        """Reset internal offset to the start and return self."""
         self.offset = 0
         return self
 
 
-def get_data_iterator(args, model, rollout_data):
+def get_data_iterator(
+    args: Namespace,
+    model: torch.nn.Module | Sequence[torch.nn.Module],
+    rollout_data: RolloutBatch,
+) -> tuple[list[DataIterator], list[int]]:
     """
-    Creates data iterators for training and log probability evaluation, supporting both static and dynamic batch sizes,
-    with optional virtual pipeline parallelism and sequence length balancing.
-    Args:
-        args: An object containing configuration parameters, including batch sizes, micro batch sizes,
-              dynamic batch size usage, and maximum tokens per GPU et.al.
-        model: The model or list of model stages, used to extract configuration for parallelism.
-        rollout_data: A dictionary containing rollout data, including 'total_lengths' for each sample.
-    Returns:
-        tuple: A tuple containing:
-            - data_iterator: List of DataIterator objects for log probability evaluation.
-            - num_microbatches: Number of microbatches for log probability evaluation.
+    Create iterators and a micro-batch schedule for a rollout step.
+
+    - If `use_dynamic_batch_size` is False, splits into fixed-size contiguous
+      micro-batches of `micro_batch_size`.
+    - If True, computes the number of micro-batches per local step based on
+      `max_tokens_per_gpu` and per-sample lengths, all-reduces to a DP-wide
+      maximum, optionally enforces divisibility for Virtual Pipeline Parallelism (VPP), and builds a balanced
+      index schedule to equalize token counts across micro-batches.
+
+    Returns `(data_iterators, num_microbatches)` where:
+    - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
+    - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     dp_group = mpu.get_data_parallel_group()
@@ -179,8 +290,15 @@ def get_data_iterator(args, model, rollout_data):
     cp_size = mpu.get_context_parallel_world_size()
 
     num_local_samples = len(rollout_data["total_lengths"])
-    num_local_gbs = args.global_batch_size // dp_size
+    global_batch_size = rollout_data.get("dynamic_global_batch_size", args.global_batch_size)
+    num_local_gbs = global_batch_size // dp_size
     num_steps_per_rollout = num_local_samples // num_local_gbs
+
+    if global_batch_size != args.global_batch_size:
+        logger.info(
+            f"Using dynamic global_batch_size={global_batch_size} (original={args.global_batch_size}), "
+            f"num_local_samples={num_local_samples}, num_steps_per_rollout={num_steps_per_rollout}"
+        )
 
     def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
         data_iterator = []
@@ -238,37 +356,38 @@ def get_data_iterator(args, model, rollout_data):
     )
 
 
-def log_rollout_data(rollout_id, args, rollout_data):
+def log_rollout_data(
+    rollout_id: int,
+    args: Namespace,
+    rollout_data: RolloutBatch,
+) -> None:
+    """
+    Summarize rollout fields and log reduced metrics on PP last stage, TP rank 0.
+
+    - Tensor-valued lists are concatenated and averaged. For token-level metrics
+      like log-probs/returns/advantages/values, computes a CP-correct sample mean
+      using `loss_masks` and total/response lengths.
+    - Non-tensor lists are averaged elementwise.
+    - Scalars are converted to Python numbers.
+    """
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         cp_size = mpu.get_context_parallel_world_size()
         log_dict = {}
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
-
-        # Add length statistics for better monitoring
-        if response_lengths:
-            response_lengths_tensor = torch.tensor(response_lengths, dtype=torch.float32)
-            log_dict["rollout/response_lengths_mean"] = response_lengths_tensor.mean().item()
-            log_dict["rollout/response_lengths_max"] = response_lengths_tensor.max().item()
-            log_dict["rollout/response_lengths_min"] = response_lengths_tensor.min().item()
-
-        if total_lengths:
-            total_lengths_tensor = torch.tensor(total_lengths, dtype=torch.float32)
-            log_dict["rollout/total_lengths_mean"] = total_lengths_tensor.mean().item()
-            log_dict["rollout/total_lengths_max"] = total_lengths_tensor.max().item()
-            log_dict["rollout/total_lengths_min"] = total_lengths_tensor.min().item()
-
-            # Calculate prompt lengths (total - response)
-            if response_lengths and len(response_lengths) == len(total_lengths):
-                prompt_lengths = [total - response for total, response in zip(total_lengths, response_lengths)]
-                prompt_lengths_tensor = torch.tensor(prompt_lengths, dtype=torch.float32)
-                log_dict["rollout/prompt_lengths_mean"] = prompt_lengths_tensor.mean().item()
-                log_dict["rollout/prompt_lengths_max"] = prompt_lengths_tensor.max().item()
-                log_dict["rollout/prompt_lengths_min"] = prompt_lengths_tensor.min().item()
+        max_seq_lens = rollout_data.get("max_seq_lens", None)
 
         for key, val in rollout_data.items():
-            if key == "tokens" or key == "loss_masks" or key == "sample_indices":
+            if key in [
+                "tokens",
+                "multimodal_train_inputs",
+                "loss_masks",
+                "sample_indices",
+                "rollout_routed_experts",
+                "max_seq_lens",
+                "dynamic_global_batch_size",
+            ]:
                 continue
             # Upload per sample mean for each rollout value
             # There are the following assumptions:
@@ -277,18 +396,34 @@ def log_rollout_data(rollout_id, args, rollout_data):
                 if isinstance(val[0], torch.Tensor):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
-                    val = torch.cat(val).clone().detach()
-                    if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages", "values"]:
-                        sum_of_sample_mean = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks)
+                    if key in [
+                        "log_probs",
+                        "ref_log_probs",
+                        "rollout_log_probs",
+                        "returns",
+                        "advantages",
+                        "values",
+                        "teacher_log_probs",
+                        "opd_reverse_kl",
+                    ]:
+                        val = torch.cat(val).clone().detach()
+                        sum_of_sample_mean = get_sum_of_sample_mean(
+                            total_lengths,
+                            response_lengths,
+                            loss_masks,
+                            qkv_format=args.qkv_format,
+                            max_seq_lens=max_seq_lens,
+                        )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
+                        val = torch.cat(val).clone().detach()
                         val = val.mean() * cp_size
                 else:
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             else:
-                raise ValueError(f"Unsupported type: {type(val)}")
+                raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
@@ -309,8 +444,72 @@ def log_rollout_data(rollout_id, args, rollout_data):
     if args.log_passrate:
         log_passrate(rollout_id, args, rollout_data)
 
+    if args.log_correct_samples:
+        if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
+            cp_size = mpu.get_context_parallel_world_size()
+            log_dict = {}
+            response_lengths = rollout_data["response_lengths"]
+            loss_masks = rollout_data["loss_masks"]
+            total_lengths = rollout_data["total_lengths"]
 
-def log_multi_turn_data(rollout_id, args, rollout_data):
+            def quantile(total_value, n_quantiles, data) -> dict:
+                import math
+
+                assert n_quantiles > 1, f"n_quantiles({n_quantiles}) must be greater than 1."
+
+                quantiles = [((i + 1) / n_quantiles) for i in range(n_quantiles)]
+                cut_points = [total_value * q for q in quantiles]
+                cut_points[-1] = total_value
+
+                count = [0] * n_quantiles
+                for d in data:
+                    for i, point in enumerate(cut_points):
+                        if d <= point:
+                            count[i] += 1
+                            break
+
+                total = sum(count) + 1e-9
+                percentile = [c / total for c in count]
+
+                percentile = {f"p{min(math.ceil(q*100),100)}": p for q, p in zip(quantiles, percentile, strict=True)}
+                return percentile
+
+            raw_rewards = rollout_data["raw_reward"]
+            # Additional metrics for correct cases are calculated separately below.
+            correct_response_lengths = []
+            correct_total_lengths = []
+            correct_loss_masks = []
+            correct_entropy = []
+            for i, raw_reward in enumerate(raw_rewards):
+                if raw_reward == 1:
+                    correct_response_lengths.append(response_lengths[i])
+                    correct_total_lengths.append(total_lengths[i])
+                    correct_loss_masks.append(loss_masks[i])
+                    correct_entropy.append(-rollout_data["log_probs"][i])
+            num_correct_responses = len(correct_total_lengths)
+            rollout_data["correct_response_lengths"] = correct_response_lengths
+            correct_response_length_percentile = quantile(
+                args.rollout_max_response_len, 4, rollout_data["correct_response_lengths"]
+            )
+            for p, val in correct_response_length_percentile.items():
+                rollout_data[f"correct_length/{p}"] = [val] * num_correct_responses
+            if len(correct_entropy) > 0:
+                sum_of_sample_mean = get_sum_of_sample_mean(
+                    correct_total_lengths, correct_response_lengths, correct_loss_masks
+                )
+                correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
+                rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
+            else:
+                rollout_data["correct_entropy"] = [0] * num_correct_responses
+
+
+def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
+    """
+    Log multi-turn auxiliary metrics such as raw/observed response lengths and rounds.
+
+    Operates only on PP last stage and TP rank 0. Uses GPU tensors when available
+    to compute statistics without host transfers.
+    """
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         log_dict = {}
         for key, val in rollout_data.items():
@@ -343,105 +542,58 @@ def log_multi_turn_data(rollout_id, args, rollout_data):
         gather_log_data("multi_turn", args, rollout_id, log_dict)
 
 
-def log_passrate(rollout_id, args, rollout_data):
+def log_passrate(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
+    """
+    Compute pass@k metrics from `raw_reward` groups and log the results.
+
+    `raw_reward` is reshaped to `[group_number, group_size]`, then pass@k is
+    estimated per problem and averaged.
+    """
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         log_dict = {}
         for key, val in rollout_data.items():
             if key != "raw_reward":
                 continue
 
-            group_size = args.n_samples_per_prompt
-            group_number = args.rollout_batch_size
-            assert len(val) == group_number * group_size
-            pass_rate_name_list = [2**i for i in range(int(math.log2(group_size)) + 1)]
-
-            val = np.array(val).reshape(group_number, group_size)
-
-            def estimate_pass_at_k(num_samples, num_correct, k):
-                """
-                Estimates pass@k of each problem and returns them in an array.
-                """
-
-                def estimator(n, c, k):
-                    """
-                    Calculates 1 - comb(n - c, k) / comb(n, k).
-                    """
-                    if n - c < k:
-                        return 1.0
-                    return 1.0 - np.prod(1.0 - k / np.arange(n - c + 1, n + 1))
-
-                return np.array([estimator(int(n), int(c), k) for n, c in zip(num_samples, num_correct)])
-
-            for k in pass_rate_name_list:
-                num_correct = np.sum(val == 1, axis=1)
-                num_samples = np.full(group_number, group_size)
-
-                pass_k_estimates = estimate_pass_at_k(num_samples, num_correct, k)
-
-                pass_k = np.mean(pass_k_estimates)
-                log_dict[f"pass@{k}"] = pass_k
+            log_dict |= compute_pass_rate(
+                flat_rewards=val,
+                group_size=args.n_samples_per_prompt,
+                num_groups=args.rollout_batch_size,
+            )
 
         gather_log_data("passrate", args, rollout_id, log_dict)
 
 
-def log_perf_data(rollout_id, args):
-    timer_instance = Timer()
-    if (
-        mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.is_pipeline_last_stage()
-        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-    ):
-        log_dict = {f"perf/{key}_time": val for key, val in timer_instance.log_dict().items()}
-
-        if "perf/actor_train_time" in log_dict:
-            world_size = dist.get_world_size()
-            total_fwd_flops = calculate_fwd_flops(seqlens=timer_instance.seq_lens, args=args) / world_size / 1e12
-
-            if "perf/log_probs_time" in log_dict:
-                log_dict["perf/log_probs_tflops"] = total_fwd_flops / log_dict["perf/log_probs_time"]
-
-            if "perf/ref_log_probs_time" in log_dict:
-                log_dict["perf/ref_log_probs_tflops"] = total_fwd_flops / log_dict["perf/ref_log_probs_time"]
-
-            if log_dict["perf/actor_train_time"] > 0:
-                log_dict["perf/actor_train_tflops"] = 3 * total_fwd_flops / log_dict["perf/actor_train_time"]
-
-        if "perf/train_wait_time" in log_dict and "perf/train_time" in log_dict:
-            total_time = log_dict["perf/train_wait_time"] + log_dict["perf/train_time"]
-            if total_time > 0:
-                log_dict["perf/total_train_time"] = total_time
-                log_dict["perf/wait_time_ratio"] = log_dict["perf/train_wait_time"] / total_time
-
-        print(f"perf {rollout_id}: {log_dict}")
-        if args.use_wandb:
-            log_dict["rollout/step"] = (
-                rollout_id
-                if not args.wandb_always_use_train_step
-                else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
-            )
-            wandb.log(log_dict)
-
-        if args.use_tensorboard:
-            from slime.utils.tensorboard_utils import _TensorboardAdapter
-
-            tb = _TensorboardAdapter(args)
-            tb.log(
-                data=log_dict,
-                step=(
-                    rollout_id
-                    if not args.wandb_always_use_train_step
-                    else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
-                ),
-            )
-    timer_instance.reset()
+def log_perf_data(rollout_id: int, args: Namespace) -> None:
+    train_metric_utils.log_perf_data_raw(
+        rollout_id=rollout_id,
+        args=args,
+        is_primary_rank=(
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.is_pipeline_last_stage()
+            and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+        ),
+        compute_total_fwd_flops=lambda seq_lens: calculate_fwd_flops(seqlens=seq_lens, args=args)
+        / dist.get_world_size()
+        / 1e12,
+    )
 
 
 def sync_actor_critic_data(
-    args,
-    rollout_data: Optional[dict[str, list[torch.Tensor]]] = None,
-    group: Optional[dist.ProcessGroup] = None,
-):
-    values, log_probs, ref_log_probs = map(rollout_data.get, ("values", "log_probs", "ref_log_probs"))
+    args: Namespace,
+    rollout_data: RolloutBatch | None = None,
+    group: dist.ProcessGroup | None = None,
+) -> None:
+    """
+    Broadcast `values` (from critic) and optionally `log_probs`/`ref_log_probs`
+    (from actor) across PP ranks to align data dependencies.
+
+    - Values are broadcast from src=1.
+    - Log-probs and ref-log-probs are broadcast from src=0 when KL is used.
+    Updates `rollout_data` in place with the synchronized tensors.
+    """
+    log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"
+    values, log_probs, ref_log_probs = map(rollout_data.get, ("values", log_probs_key, "ref_log_probs"))
 
     # return when not the pp last stage
     if not values and not log_probs:
@@ -456,13 +608,24 @@ def sync_actor_critic_data(
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not log_probs:
-            ref_log_probs = [torch.empty_like(value) for value in values]
             log_probs = [torch.empty_like(value) for value in values]
-        for ref_log_prob, log_prob in zip(ref_log_probs, log_probs):
-            handles.append(dist.broadcast(ref_log_prob, src=0, group=group, async_op=True))
+        if not ref_log_probs:
+            ref_log_probs = [torch.empty_like(value) for value in values]
+        for ref_log_prob, log_prob in zip(ref_log_probs, log_probs, strict=False):
             handles.append(dist.broadcast(log_prob, src=0, group=group, async_op=True))
+            handles.append(dist.broadcast(ref_log_prob, src=0, group=group, async_op=True))
 
     for handle in handles:
         handle.wait()
 
-    rollout_data.update({"values": values, "log_probs": log_probs, "ref_log_probs": ref_log_probs})
+    rollout_data.update(
+        {
+            k: v
+            for k, v in {
+                "values": values,
+                log_probs_key: log_probs,
+                "ref_log_probs": ref_log_probs,
+            }.items()
+            if v is not None
+        }
+    )

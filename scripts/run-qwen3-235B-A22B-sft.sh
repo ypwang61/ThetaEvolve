@@ -49,6 +49,7 @@ SFT_ARGS=(
    --rollout-function-path slime.rollout.sft_rollout.generate_rollout
    --prompt-data ${BASE_FOLDER}/openhermes2_5.parquet
    --input-key messages
+   # --apply-chat-template
    --rollout-shuffle
    --num-epoch 3
    --rollout-batch-size 128
@@ -80,10 +81,9 @@ PERF_ARGS=(
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-5
-   --lr-warmup-iters 128
    --lr-decay-style cosine
    --min-lr 1e-6
-   --lr-warmup-fraction 0.9
+   --lr-warmup-fraction 0.1
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
@@ -131,7 +131,8 @@ RUNTIME_ENV_JSON="{
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"no_proxy\": \"${no_proxy}\",
-    \"MASTER_ADDR\": \"${MASTER_ADDR}\"
+    \"MASTER_ADDR\": \"${MASTER_ADDR}\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"expandable_segments:True\"
   }
 }"
 
@@ -144,7 +145,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${CKPT_ARGS[@]} \
    ${SFT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
-   ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \

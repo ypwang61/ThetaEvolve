@@ -1,6 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+**/__pycache__/
+**/*.pyc
 *$py.class
 
 # C extensions
@@ -197,3 +199,10 @@ _examples_synced/
 train_log.txt
 
 *@anthropic-ai*
+
+# local artifacts
+DeepSeek-R1-0528-Qwen3-8B/
+Nemotron-Research-Reasoning-Qwen-1.5B/
+Results/
+data/
+run.sh
